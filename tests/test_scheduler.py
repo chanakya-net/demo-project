@@ -79,6 +79,10 @@ class ValidationTests(unittest.TestCase):
             Task(id="x", status="bogus")
         self.assertEqual(q.stats()["total"], 0)
 
+    def test_task_rejects_timestamp_too_large_for_float(self):
+        with self.assertRaises(ValidationError):
+            Task(id="a", next_run_at=10**400)
+
     def test_failed_status_is_valid_and_counted(self):
         self.assertEqual(Task(id="x", status="failed").status, "failed")
         self.assertEqual(TaskQueue().stats(), {
@@ -86,12 +90,44 @@ class ValidationTests(unittest.TestCase):
             "failed": 0, "dead_letter": 0,
         })
 
+    def test_enqueue_validates_dependencies_and_payload_before_copying(self):
+        class UncopyablePayload(dict):
+            def __deepcopy__(self, memo):
+                raise TypeError("cannot copy")
+
+        q = TaskQueue()
+        before = q.stats()
+        invalid = [
+            {"depends_on": "parent"}, {"depends_on": 123},
+            {"payload": (n for n in ())}, {"payload": UncopyablePayload()},
+        ]
+        for kwargs in invalid:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValidationError):
+                    q.enqueue("child", **kwargs)
+                self.assertEqual(q.stats(), before)
+
+    def test_payload_requires_string_keys_at_every_depth(self):
+        q = TaskQueue()
+        payloads = ({1: "a", "b": 2}, {1: "a"}, {"items": [{"nested": {1: "a"}}]})
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValidationError):
+                    Task(id="a", payload=payload)
+                with self.assertRaises(ValidationError):
+                    q.enqueue("a", payload=payload)
+        self.assertEqual(q.stats()["total"], 0)
+
     def test_returned_tasks_are_copies(self):
         q = TaskQueue()
-        task = q.enqueue("a", payload={"k": "v"})
+        deps, payload = ["parent"], {"k": ["v"]}
+        task = q.enqueue("a", depends_on=deps, payload=payload)
+        deps.clear()
+        payload["k"].clear()
         task.payload["k"] = "changed"
         task.status = "completed"
-        self.assertEqual(q.get("a").payload, {"k": "v"})
+        self.assertEqual(q.get("a").depends_on, ["parent"])
+        self.assertEqual(q.get("a").payload, {"k": ["v"]})
         self.assertEqual(q.get("a").status, "pending")
 
 
@@ -118,6 +154,15 @@ class DependencyTests(unittest.TestCase):
         q.enqueue("later", next_run_at=100.0)
         self.assertIsNone(q.claim_next(now=99.9))
         self.assertEqual(q.claim_next(now=100.0).id, "later")
+
+    def test_claim_rejects_invalid_now_without_claiming(self):
+        for now in (math.nan, math.inf, True, "100"):
+            with self.subTest(now=now):
+                q = TaskQueue()
+                q.enqueue("later", next_run_at=100.0)
+                with self.assertRaises(ValidationError):
+                    q.claim_next(now)
+                self.assertEqual(q.get("later").status, "pending")
 
     def test_complete_rejects_unknown_or_non_running_task(self):
         q = TaskQueue()
@@ -167,6 +212,11 @@ class RetryTests(unittest.TestCase):
             [2.0, 4.0, 8.0, 10.0, 10.0],
         )
         self.assertEqual(compute_backoff(10**6, 1.0, 60.0), 60.0)
+        for args, expected in [((10**6, 0.0, 60.0), 0.0),
+                               ((10**6, 1.0, 0.0), 0.0),
+                               ((1075, 2.0**-1074, 60.0), 1.0)]:
+            with self.subTest(args=args):
+                self.assertEqual(compute_backoff(*args), expected)
         for args in [(0, 1.0, 10.0), (True, 1.0, 10.0), (1, -1.0, 10.0), (1, 1.0, math.inf)]:
             with self.subTest(args=args), self.assertRaises(ValidationError):
                 compute_backoff(*args)
@@ -193,8 +243,15 @@ class RetryTests(unittest.TestCase):
 
     def test_zero_retries_dead_letters_on_first_failure(self):
         task = Task(id="x", status="running", max_retries=0)
-        apply_failure(task, "boom", now=5.0)
-        self.assertEqual((task.status, task.attempts), ("dead_letter", 1))
+        apply_failure(task, "boom", now=1e308, base_delay=1e308, max_delay=1e308)
+        self.assertEqual((task.status, task.attempts, task.next_run_at), ("dead_letter", 1, 0.0))
+
+    def test_retry_timestamp_overflow_leaves_task_unchanged(self):
+        task = Task(id="x", status="running", next_run_at=7.0, last_error="previous")
+        before = task.to_dict()
+        with self.assertRaises(ValidationError):
+            apply_failure(task, "boom", now=1e308, base_delay=1e308, max_delay=1e308)
+        self.assertEqual(task.to_dict(), before)
 
     def test_dead_letter_dependency_keeps_dependent_blocked(self):
         q = TaskQueue()
@@ -225,7 +282,7 @@ class _TempDirCase(unittest.TestCase):
 class PersistenceTests(_TempDirCase):
     def test_state_survives_reload_across_instances(self):
         q1 = TaskQueue(SnapshotStore(self.path), base_delay=5.0)
-        q1.enqueue("a", priority=1, payload={"k": "v"})
+        q1.enqueue("a", priority=1, payload={"k": [{"nested": "v"}]})
         q1.enqueue("b", priority=1)
         q1.enqueue("c", priority=0, depends_on=["a"])
         q1.claim_next(now=0.0)
@@ -301,6 +358,8 @@ class StoreTests(_TempDirCase):
                 {"schema_version": 1, "next_seq": 1, "tasks": [good_task], "x": 1}),
             "bad_task": json.dumps({"schema_version": 1, "next_seq": 1,
                                     "tasks": [dict(good_task, max_retries=-1)]}),
+            "oversized_timestamp": json.dumps({"schema_version": 1, "next_seq": 1,
+                                               "tasks": [dict(good_task, next_run_at=10**400)]}),
             "unknown_task_key": json.dumps({"schema_version": 1, "next_seq": 1,
                                             "tasks": [dict(good_task, extra=1)]}),
             "duplicate_ids": json.dumps({"schema_version": 1, "next_seq": 2, "tasks": [
@@ -330,6 +389,14 @@ class CliTests(_TempDirCase):
         with contextlib.redirect_stdout(out):
             code = cli.main(list(argv))
         return code, json.loads(out.getvalue())
+
+    def test_next_rejects_nan_without_changing_snapshot(self):
+        store = ["--store", self.path]
+        self.run_cli(*store, "enqueue", "later", "--next-run-at", "100")
+        before = self.read_bytes()
+        code, out = self.run_cli(*store, "next", "--now", "nan")
+        self.assertEqual((code, out.get("error", {}).get("type")), (1, "ValidationError"))
+        self.assertEqual(self.read_bytes(), before)
 
     def test_full_lifecycle_via_cli(self):
         store = ["--store", self.path]

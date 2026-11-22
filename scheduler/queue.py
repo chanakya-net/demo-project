@@ -31,6 +31,8 @@ from .models import (
     InvalidTransitionError,
     Task,
     TaskNotFoundError,
+    ValidationError,
+    _is_finite_number,
     validate_enqueue,
 )
 from .retry import DEFAULT_BASE_DELAY, DEFAULT_MAX_DELAY, apply_failure, compute_backoff
@@ -55,18 +57,26 @@ class TaskQueue:
         task = Task(
             id=task_id,
             priority=priority,
-            depends_on=list(depends_on) if depends_on is not None else [],
+            depends_on=depends_on if depends_on is not None else [],
             max_retries=max_retries,
-            payload=copy.deepcopy(payload) if payload is not None else {},
+            payload=payload if payload is not None else {},
             next_run_at=next_run_at,
             created_seq=self._next_seq,
         )
         validate_enqueue(task, self._tasks)
+        task.depends_on = list(task.depends_on)
+        try:
+            task.payload = copy.deepcopy(task.payload)
+            result = copy.deepcopy(task)
+        except TypeError as exc:
+            raise ValidationError(f"task data could not be copied: {exc}") from exc
         self._commit(task, self._next_seq + 1)
-        return copy.deepcopy(task)
+        return result
 
     def claim_next(self, now):
         """Mark the next runnable task ``running`` and return a copy, or None."""
+        if not _is_finite_number(now):
+            raise ValidationError("now must be a finite number")
         runnable = [t for t in self._tasks.values() if self._is_runnable(t, now)]
         if not runnable:
             return None

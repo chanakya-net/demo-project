@@ -49,7 +49,10 @@ def _is_int(value):
 def _is_finite_number(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    return math.isfinite(value)
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _require(condition, message):
@@ -106,9 +109,18 @@ class Task:
     def _validate_payload(self):
         _require(isinstance(self.payload, dict), "payload must be a dict")
         try:
-            json.dumps(self.payload, allow_nan=False)
+            json.dumps(self.payload, sort_keys=True, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValidationError(f"payload must be JSON-serializable: {exc}") from None
+        pending = [self.payload]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                _require(all(isinstance(key, str) for key in value),
+                         "payload object keys must be strings")
+                pending.extend(value.values())
+            elif isinstance(value, (list, tuple)):
+                pending.extend(value)
 
     def to_dict(self):
         return asdict(self)
